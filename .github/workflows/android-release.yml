@@ -1,0 +1,161 @@
+name: Android APK Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/android-release.yml"
+      - "src/**"
+      - "src-tauri/**"
+      - "scripts/sync-android-icons.mjs"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "tsconfig*.json"
+      - "vite.config.ts"
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Build and publish Android ARM64 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android and native build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+          cache-on-failure: true
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build release APK
+        run: pnpm tauri android build --apk --target aarch64 --ci
+
+      - name: Sign and verify APK
+        id: apk
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/android-release.keystore"
+          if [[ -n "${KEYSTORE_BASE64:-}" ]]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KS"
+            SIGNING="release"
+            test -n "$KEY_ALIAS"
+            test -n "$STORE_PASSWORD"
+            test -n "$KEY_PASSWORD"
+          else
+            SIGNING="test"
+            KEY_ALIAS=androiddebugkey
+            STORE_PASSWORD=android
+            KEY_PASSWORD=android
+            keytool -genkeypair -noprompt -keystore "$KS" -storepass "$STORE_PASSWORD" -keypass "$KEY_PASSWORD" -alias "$KEY_ALIAS" -dname "CN=HGhubX CI Test,O=HGhubX,C=CN" -keyalg RSA -keysize 2048 -validity 10000
+          fi
+          trap 'rm -f "$KS"' EXIT
+          export STORE_PASSWORD KEY_PASSWORD
+          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json')).version")"
+          APK="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*release*.apk' -print -quit)"
+          test -n "$APK"
+          mkdir -p artifacts
+          cp LICENSE artifacts/LICENSE.txt
+          OUT="artifacts/HGhubX_${VERSION}_arm64-v8a_${SIGNING}.apk"
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          "$BT/zipalign" -f -P 16 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD --v4-signing-enabled false --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose --print-certs "$OUT"
+          "$BT/zipalign" -c -P 16 4 "$OUT"
+          "$BT/aapt" dump badging "$OUT" > "$RUNNER_TEMP/apk-badging.txt"
+          head -n 5 "$RUNNER_TEMP/apk-badging.txt"
+          (cd artifacts && sha256sum *.apk > SHA256SUMS.txt)
+          echo "signing=$SIGNING" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhubX-Android-ARM64
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING: ${{ steps.apk.outputs.signing }}
+          VERSION: ${{ steps.apk.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="android-v${VERSION}-build.${GITHUB_RUN_NUMBER}"
+          if [[ "$SIGNING" == test ]]; then
+            cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Android ARM64 APK，适用于 Android 7.0 及以上的 ARM64 设备。
+          
+          本包使用 release 优化构建，并使用临时 CI 测试证书签名；并非正式签名发行版。不同构建的测试证书不同，后续安装可能需要先卸载旧版（卸载会删除本地数据）。配置仓库的 ANDROID_KEY_BASE64、ANDROID_KEY_ALIAS、ANDROID_KEYSTORE_PASSWORD、ANDROID_KEY_PASSWORD 后，流程会使用固定的正式证书。
+          
+          附带 SHA256SUMS.txt。APK 已通过 apksigner 和 zipalign 验证。未执行真机运行测试。
+          NOTES
+          else
+            cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Android ARM64 release APK，适用于 Android 7.0 及以上的 ARM64 设备，使用仓库配置的固定签名证书。
+          
+          附带 SHA256SUMS.txt。APK 已通过 apksigner 和 zipalign 验证。未执行真机运行测试。
+          NOTES
+          fi
+          printf '\nRequired Notice: Copyright (c) 2026 HGhubX contributors (https://github.com/Minireel/HGhub)\nLicense: PolyForm Noncommercial 1.0.0; see LICENSE.txt.\n' >> "$RUNNER_TEMP/release-notes.md"
+          printf '\nSource commit: %s\n' "$GITHUB_SHA" >> "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            ARGS=()
+            if [[ "$SIGNING" == test ]]; then ARGS+=(--prerelease); fi
+            gh release create "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "HGhubX ${VERSION} Android ARM64 (build ${GITHUB_RUN_NUMBER})" --notes-file "$RUNNER_TEMP/release-notes.md" "${ARGS[@]}"
+          fi
